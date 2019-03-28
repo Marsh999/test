@@ -1,0 +1,183 @@
+#!/usr/bin/env/ Python
+#-*- coding:utf-8 -*-
+#author：Lixiao
+
+'''
+优矿Fama三因子实现+R_square.py
+描述：从优矿平台获取数据验证砝码三因子有效性
+     Fama-French三因子模型无疑是量化领域最经典的模型之一，该模型的提出是在论文《commom risk factors in returns on bonds and stocks》里，本文论文中的方法在中国A股市场上进行了实证。
+     E(R(t))=Rf(t)+bE(RM(t)−Rf(t))+sE(SMB(t))+hE(HML(t))
+     RM−Rf表示的是市场因子，SMB表示的是规模(市值)因子，HML表示账面市值比因子
+     把股票按每年5月末时的市值（size）大小进行排序，把股票分为5组；
+     再依据5月末时的账面市值比（我们取1/PB）大小对800只股票进行排序，分为5组;
+     再分别对市值、账面市值比取交集，股票即被分25组。
+输出：25个组合的R square
+'''
+
+import numpy as np
+import pandas as pd 
+#加载画图需要用的包
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+mpl.style.use('ggplot')
+import seaborn as sns
+from sklearn import linear_model
+
+# 研究步骤：
+# 1.寻找三因子
+# 2.因子中间独立性+进行回归分析
+
+def get25Groups(breakpoint): 
+    '''
+    在breakpoint时间点按照市值、账面市值将股票分为25组
+    param breakpoint：时间点 str eg:'20140101'
+    '''
+    universe = set_universe('000906.ZICN',date=breakpoint)        #股票池为中证800
+    C=DataAPI.MktEqudGet(ticker='000028',beginDate=str(int(breakpoint)-20),endDate=breakpoint,field=u"ticker,tradeDate")
+    breakpoint=filter(lambda x:x.isdigit(),C.iat[len(C)-1,1])     #取breakpoint前最近一个交易日日期
+    ME=DataAPI.MktEqudGet(tradeDate=breakpoint,secID=universe,field=u"ticker,marketValue").dropna()
+    MEq=np.zeros(6)                                               #用于存储ME的分位值
+    ME_5=pd.Series([])                                            #用于存储依据市值分好的5个组
+    BP=DataAPI.MktStockFactorsOneDayGet(tradeDate=breakpoint,secID=universe,field=u"ticker,PB").dropna() 
+    BP=BP[BP>0].dropna()                                          #去掉PB值为负的股票
+    BP[['PB']]=1/BP[['PB']]                                       #取1/PB，为账面市值比
+    BPq=np.zeros(6)                                               #用于存储1/PB的分位值
+    BP_5=pd.Series([])                                            #用于存储依据账面市值比分好的5个组
+    for i in range(5):
+        MEq[i+1]=np.percentile(ME['marketValue'],(i+1)*20)        #算出市值大小的20%,40%,60%,80%分位值
+        BPq[i+1]=np.percentile(BP['PB'],(i+1)*20)
+        D=ME[(ME['marketValue']>MEq[i]) & (ME['marketValue']<=MEq[i+1])]['ticker'].tolist()     #取市值处于相应分位值区间的股票
+        ME_5 = pd.concat([ME_5,pd.Series(D)],axis=1) if not ME_5.empty else pd.Series(D)        #存于dataframe里
+        E=BP[(BP['PB']>BPq[i]) & (BP['PB']<=BPq[i+1])]['ticker'].tolist()
+        BP_5 = pd.concat([BP_5,pd.Series(E)],axis=1) if not BP_5.empty else pd.Series(E)
+    ME_5.columns=range(5)                                         #重命名列名
+    BP_5.columns=range(5)
+    Group25=pd.Series([])                                         #用于存著交叉取交集后的25个股票组合
+    for i in range(5):
+        for j in range(5):
+            s1=ME_5[i].dropna().tolist()
+            s2=BP_5[j].dropna().tolist() 
+            stocks=pd.Series(list(set(s1).intersection(set(s2)))) #取交集
+            Group25 = pd.concat([Group25,stocks],axis=1) if not Group25.empty else stocks
+    Group25.columns=range(25)
+    # print(Group25)
+    return Group25
+
+def getReturnMonthly(x,Year):
+    '''
+    得到投资组合x从Year的6月到Year+1的5月的月收益率序列
+    param x:股票组合 list
+    param Year:年份 int eg：2014
+    '''
+    #先用交易日日历得到Year的5月到Year+1的5月的月末交易日日期
+    from CAL.PyCAL import *
+    data=DataAPI.TradeCalGet(exchangeCD=u"XSHG",beginDate=str(Year*10000+501),endDate=str((Year+1)*10000+601),field=['calendarDate','isMonthEnd'])
+    data = data[data['isMonthEnd'] == 1]
+    date= map(lambda x: x[0:4]+x[5:7]+x[8:10], data['calendarDate'].values.tolist())
+    #调用投资组合x每只股票每个月末的市值，收盘价用来计算收盘价
+    returnMonthly=np.zeros(12)
+    for i in range(12):
+        inf1=DataAPI.MktEqudAdjGet(tradeDate=date[i],ticker=x,field=u"ticker,closePrice").set_index('ticker')  #前一个月的收盘价
+        inf2=DataAPI.MktEqudAdjGet(tradeDate=date[i+1],ticker=x,field=u"ticker,marketValue,closePrice").set_index('ticker')   #当月的收盘价和市值
+        Return=pd.concat([inf2,inf1],axis=1)
+        Return.columns=['Weight','Return','WReturn']                   #计算每只股票收益率和市值加权的权重以及两者的乘积
+        Return['Weight']=Return['Weight']/Return['Weight'].sum()
+        Return['Return']=(Return['WReturn']-Return['Return'])/Return['Return']
+        Return['WReturn']=Return['Weight']*Return['Return']
+        returnMonthly[i]=Return['WReturn'].sum()
+    # print(returnMonthly)
+    return returnMonthly
+
+def returnMonthly():
+    '''
+    计算25种组合11年来每月收益
+    '''
+    EReturn=pd.DataFrame(np.zeros((25,12*11)))                                    #用于存储25个组合的超额收益序列
+    for i in range(25):
+        a=[]
+        for Year in [2007,2008,2009,2010,2011,2012,2013,2014,2015,2016,2017]:
+            Group25=get25Groups(str(Year*10000+531))                             #每年进行分组
+            a=a+(getReturnMonthly(Group25[i].dropna().tolist(),Year)).tolist()   #收益率转化为list，方便每年相加
+        EReturn.iloc[i,:]=np.array(a)        
+    # print(EReturn)
+    return EReturn
+
+def yinZi():
+    '''
+    计算每年的SMB和HML因子
+    '''
+    r_groups=pd.DataFrame()                                                       #用于存储每个组合的月收益率序列，方便我们之后查看
+    r_groups['SL']=np.zeros(132)
+    # SMB
+    returnMonthly25=returnMonthly()
+    SMB=returnMonthly25[0:5].sum()*0.2-returnMonthly25[-5:].sum()*0.2
+    HML=returnMonthly25[returnMonthly25.index.isin([0,5,10,15,20])].sum()*0.2-returnMonthly25[returnMonthly25.index.isin([4,9,14,19,24])].sum()*0.2
+    # print(SMB,HML)
+    return SMB,HML,returnMonthly25
+
+def yinZiMarket():
+    '''
+    计算市场因子（RM−Rf），RM取的就是中证800指数的收益，Rf取的是银行间质押式回购利率_同业拆借中心R007
+    '''
+    #先用交易日日历得到Year的5月到Year+1的5月的月末交易日日期
+    from CAL.PyCAL import *
+    data=DataAPI.TradeCalGet(exchangeCD=u"XSHG",beginDate='20070501',endDate='20180601',field=['calendarDate','isMonthEnd'])
+    data = data[data['isMonthEnd'] == 1]
+    date = map(lambda x: x[0:4]+x[5:7]+x[8:10], data['calendarDate'].values.tolist())
+    RmMonthly=np.zeros(132)
+    RfMonthly=np.zeros(132)
+    for i in range(132):
+        index1=DataAPI.MktIdxdGet(tradeDate=date[i],indexID=u"000906.ZICN",field=u"closeIndex")     #上月指数收盘
+        index2=DataAPI.MktIdxdGet(tradeDate=date[i+1],indexID=u"000906.ZICN",field=u"closeIndex")   #当月指数收盘
+        RmMonthly[i]=index2['closeIndex'][0]/index1['closeIndex'][0]-1
+        rf=DataAPI.MktIborGet(ticker=u"Shibor1D",beginDate=date[i+1],endDate=date[i+1],field=u"rate")   #当月无风险收益
+        RfMonthly[i]=rf['rate'][0]/100/12         #给出的是年化无风险收益，这里需要转化成月的
+    MF=RmMonthly-RfMonthly                        #市场因子
+    # print(MF)
+    return MF,RfMonthly
+
+def main():
+    '''
+    主程序，计算25个组合的R square
+    '''
+    # 先获取三因子
+    SMB,HML,returnMonthly25=yinZi()
+    MF,RfMonthly=yinZiMarket()
+    factor=pd.DataFrame()
+    factor['MF']=MF
+    factor['SMB']=SMB
+    factor['HML']=HML
+    # factor.index=date[1:]
+    # 获取超额收益
+    returnMonthly25=returnMonthly25.T.sub(RfMonthly,axis=0)
+    #做25次回归
+    a=np.zeros(25)   #a项
+    b=np.zeros(25)   #市场因子项系数
+    s=np.zeros(25)   #规模因子项系数
+    h=np.zeros(25)   #账面价值比项系数
+    e=np.zeros(25)   #残差项
+    R2=np.zeros(25)   #R2相关系数平方
+    for i in range(25):
+        x=np.zeros((3,132))
+        x[0]=MF
+        x[1]=SMB
+        x[2]=HML
+        y=returnMonthly25[i]
+        x=np.mat(x).T
+        # y=np.mat(y)
+        # print(x,y.values)
+        regr = linear_model.LinearRegression()
+        regr.fit(x,y)
+        # print(regr.coef_)
+        R2[i]=regr.score(x,y)
+    #显示R square
+    R2inf3=pd.DataFrame(R2.reshape(5,5))
+    R2inf3.columns=['small_BE/ME','1','2','3','big_BE/ME']
+    R2inf3.index=['small_size','1','2','3','big_size']
+    print(R2inf3)
+
+
+
+if __name__=='__main__':
+    # pass
+    main()
